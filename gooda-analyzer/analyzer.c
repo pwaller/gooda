@@ -3307,12 +3307,20 @@ func_asm(pointer_data * global_func_list, int index)
 #ifdef DBUG
 			fprintf(stderr," Basic Block %d <0x%"PRIx64"><0x%"PRIx64">\0",bb_count+1,old_loop_asm->target,loop_asm->address);
 #endif
-			sprintf(this_bb->text," Basic Block %d <0x%"PRIx64"><0x%"PRIx64">\0",bb_count+1,old_loop_asm->target,loop_asm->address);
+			this_bb->target1 = old_loop_asm->target;
+			if (loop_asm != NULL)
+				{
+				sprintf(this_bb->text," Basic Block %d <0x%"PRIx64"><0x%"PRIx64">\0",bb_count+1,old_loop_asm->target,loop_asm->address);
+				this_bb->target2 = loop_asm->address;
+				}
+			else
+				{
+				sprintf(this_bb->text," Basic Block %d \0",bb_count+1);
+				this_bb->target2 = 0;
+				}
 #ifdef DBUG
 			fprintf(stderr," BB %d text = %s\n",k,this_bb->text);
 #endif
-			this_bb->target1 = old_loop_asm->target;
-			this_bb->target2 = loop_asm->address;
 			}
 		else if (old_loop_asm->target != 0)
 			{
@@ -3322,7 +3330,15 @@ func_asm(pointer_data * global_func_list, int index)
 		else
 			{
 			sprintf(this_bb->text," Basic Block %d <0x%"PRIx64">\0",bb_count+1,loop_asm->address);
-			this_bb->target2 = loop_asm->address;
+			if (loop_asm != NULL)
+				{
+				this_bb->target2 = loop_asm->address;
+				}
+			else
+				{
+				this_bb->target2 = 0;
+				}
+			
 			}
 		if((this_bb->target1 != 0) && ((this_bb->target1 < base) || (this_bb->target1 > end)))deadbeef++;		
 //		last bb
