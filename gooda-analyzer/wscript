@@ -1,0 +1,228 @@
+#!/usr/bin/env python
+
+MICROARCHITECTURES = {
+    "42": ("snb", "Sandy Bridge"),
+    "44": ("wsm", "Westemere"),
+    "47": ("wsm", "Westemere"),
+}
+
+import waflib
+from waflib.Configure import conf
+
+def go(ctx):
+    from waflib.Options import commands
+    commands += ["configure", "build", "install"]
+    
+@conf
+def check_kernel(ctx, configuration_option):
+    """
+    Attempt to check kernel configuration state
+    """
+    from os.path import exists
+    import gzip
+    
+    ctx.start_msg("Checking for kernel %s" % configuration_option)
+    
+    if not exists("/proc/config.gz"):
+        ctx.end_msg("skipped because IKCONFIG_PROC disabled", color="YELLOW")
+        return
+
+    fd = gzip.open("/proc/config.gz")
+    try:
+        content = fd.read()
+    finally:
+        fd.close()
+    
+    lines = [l.strip() for l in content.split("\n")]
+    configs = [l for l in lines if not l.startswith("#")]
+    
+    def kernel_has(what):
+        return any(what in c for c in configs)
+    
+    if not kernel_has(configuration_option):
+        ctx.end_msg("no", color="RED")
+        err = "Enable %s in your kernel configuration" % what
+        raise ctx.errors.ConfigurationError(err)
+    ctx.end_msg("yes")
+
+@conf
+def show_cpu(ctx):
+    from os.path import exists
+    if not exists("/proc/cpuinfo"):
+        ctx.msg("/proc/cpuinfo", "doesn't exist, skipping check", color="YELLOW")
+        return
+
+    fd = open("/proc/cpuinfo")
+    try:
+        content = fd.read()
+    finally:
+        fd.close()
+        
+    # Put the cpu info into a dictionary
+    cpus = {}
+    cpu_infos = content.split("\n\n")
+    for cpu in cpu_infos:
+        if not cpu: continue
+        lines = [line.split(":") for line in cpu.split("\n")]
+        info = dict((line[0].strip(), ":".join(line[1:]).strip())
+                    for line in lines)
+        cpus[(info["model"], info["cpu family"])] = info
+    
+    arch = None
+    # Print CPU info for each (model, family) we come across
+    for cpu, info in sorted(cpus.iteritems()):
+        ctx.msg("CPU", info["model name"], color="WHITE")
+        ctx.msg("CPU model / family", "%s / %s" % cpu, color="WHITE")
+        
+        this_arch, name = MICROARCHITECTURES.get(info["model"], (None, None))
+        if this_arch is None:
+            msg = "Unknown microarchitecture! Please contact developers."
+            raise ctx.errors.ConfigurationError(msg)
+        
+        assert not arch or arch == this_arch, "Conflicting microarchitectures?!"
+        arch = this_arch            
+        
+        if info["model"] == "42":
+            ctx.msg("", "Need model HW bug precise=0 workaround.", color="YELLOW")
+            ctx.env.PRECISE_0_WORKAROUND = "1"
+            
+    ctx.env.MICROARCHITECTURE = arch
+    ctx.msg("Microarchitecture", name, color="WHITE")
+
+@conf
+def check_perf(ctx):
+    ctx.find_program("perf", var="PERF", mandatory=False)
+    
+    from os.path import abspath
+    
+    if ctx.env.PERF:
+        ctx.env.PERF = abspath(ctx.env.PERF)
+        try:
+            out, err = ctx.cmd_and_log([ctx.env.PERF, 'record', '-h'],
+                output=waflib.Context.BOTH,
+            )
+        except ctx.errors.WafError, e:
+            out, err = getattr(e, "stdout", ""), getattr(e, "stderr", "")
+        
+        have_patch = "--pfm-events" in err or "--pfm-events" in out
+        ctx.start_msg("Checking perf has --pfm-events")
+        if have_patch:
+            ctx.end_msg("yes", color="GREEN")
+        else:
+            ctx.end_msg("Unknown. Follow instructions in readme for patching the "
+                        "kernel tools or modify PERF in your env", color="YELLOW")
+            
+    else:
+        ctx.msg("", "Couldn't check perf patch. Set PERF=/path/to/perf",
+                color="YELLOW")
+
+@conf
+def check_objdump(ctx):
+    ctx.find_program("objdump", var="OBJDUMP")
+    out = ctx.cmd_and_log([ctx.env.OBJDUMP, '--version'],
+        output=waflib.Context.STDOUT)
+    ctx.msg("objdump version:", out.split("\n")[0], color="WHITE")
+
+def options(ctx):
+    from os import getcwd
+    from os.path import join as pjoin
+    
+    # Default the prefix to ${PWD}/install
+    prefix_option = ctx.parser.get_option("--prefix")
+    old_default, new_default = prefix_option.default, pjoin(getcwd(), "install")
+    ctx.parser.set_default("prefix", new_default)
+    prefix_option.help = prefix_option.help.replace(old_default, new_default)
+    
+    ctx.load("compiler_c")
+    
+    ctx.add_option("--debug", action="store_true",
+        help="Build with additional debug output, turn optimization off")
+
+def configure(ctx):    
+    ctx.load("compiler_c")
+    
+    for lib in "dl z iberty bfd".split():
+        ctx.check(lib=lib, uselib_store="DEFLIB")
+    
+    ctx.env.append_value("DEFINES_DEFLIB", "ANALYZE")
+    if ctx.options.debug:
+        ctx.env.append_value("DEFINES_DEFLIB", ["DBUG", "DBUGA"])
+        ctx.env.DEBUG_ENABLED = "1"
+    else:
+        ctx.env.append_value("CFLAGS_DEFLIB", ["-O2"])
+        
+    ctx.check_kernel("CONFIG_PERF_EVENTS")
+    
+    ctx.check_perf()
+    
+    ctx.check_objdump()
+    
+    ctx.show_cpu()
+    
+    ctx.to_log("Final environment")
+    ctx.to_log(ctx.env)
+
+def build(ctx):
+    if ctx.options.debug and not bool(ctx.env.DEBUG_ENABLED):
+        raise ctx.errors.WafError("Specify --debug at configure time!")
+    
+    ctx.program(
+        target=ctx.path.get_bld().make_node("gooda"),
+        use=["DEFLIB"],
+        source=("perf_gooda_read.c gooda_create.c perf_gooda_create.c "
+                "gooda_util.c analyzer.c asm2src.c column_align_intel.c "
+                "column_align_def.c column_align.c load_addr.c".split())
+    )
+    
+    if ctx.env.PRECISE_0_WORKAROUND:
+        # <Stephane Eranian>
+        # Due to HW bug in this CPU model, it does not support PEBS
+        # (precise_sampling=1 or 2) sampling.
+        # The SNB collection script relies on having precise sampling.
+        # There will be a Intel patch to fix it, but for now the workaround you can
+        # try is to edit the event file and replace precise_sampling=1 or 2 with
+        # precise_sampling=0.
+        assert ctx.path.make_node("scripts/snb_cyc_account.txt")
+        ctx(rule="sed -r 's/:precise=[12]/:precise=0/g' ${SRC} > ${TGT}",
+            source=ctx.path.find_node("scripts/snb_cyc_account.txt"),
+            target=ctx.path.make_node("scripts/snb_cyc_account.txt").get_bld(),
+            name="Hardware bug workaround for CPU model 42")
+
+    # If non $PATH perf, then substitute ^perf with $PERF for all scripts
+    if ctx.env.PERF:
+        import re
+        uses_perf = re.compile("^perf", re.M)
+        def fixup_script(ctx):
+            fixed = uses_perf.sub(ctx.env.PERF, ctx.inputs[0].read())
+            ctx.outputs[0].write(fixed)
+            
+        for script in ctx.path.ant_glob("scripts/**.sh"):
+            content = script.read()
+            if uses_perf.search(content):
+                ctx(rule=fixup_script, source=script, target=script.get_bld(),
+                    name="Fix perf path")
+    
+    # For the time being, install the list of events to the ${PREFIX}/bin
+    # directory.
+    
+    # Need a new group here to prevent install from running before the scripts
+    # have been fixed up.
+    ctx.add_group("Install scripts")
+    
+    # Pick up the build/ file if one exists (because it was patched), otherwise source
+    P = ctx.path.find_resource
+    
+    if ctx.env.MICROARCHITECTURE == "snb":
+        ctx.install_files("${PREFIX}/bin",
+            [P("scripts/snb_cyc_account.txt")])
+        ctx.install_as("${PREFIX}/bin/gooda-collect",
+                       P("scripts/run_record_cyc_snb.sh"),
+                       chmod=waflib.Utils.O755)
+        
+    elif ctx.env.MICROARCHITECTURE == "wsm":
+        ctx.install_files("${PREFIX}/bin",
+            [P("scripts/snb_cyc_account.txt")])
+        ctx.install_as("${PREFIX}/bin/gooda-collect",
+                       P("scripts/run_record_cyc_wsm_ep.sh"),
+                       chmod=waflib.Utils.O755)
+
