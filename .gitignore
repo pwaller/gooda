@@ -1,0 +1,12 @@
+build/
+install/
+
+/gooda-visualizer/
+
+perf.data
+perf.data.old
+
+.*waf*
+
+*~
+*.o
